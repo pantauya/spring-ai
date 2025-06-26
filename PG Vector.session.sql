@@ -1,0 +1,1 @@
+DELETE FROM vector_store;

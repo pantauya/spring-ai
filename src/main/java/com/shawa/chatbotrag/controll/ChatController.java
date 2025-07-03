@@ -1,13 +1,10 @@
 package com.shawa.chatbotrag.controll;
 
-
-
 import lombok.extern.slf4j.Slf4j;
-
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Optional;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -33,7 +30,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Files;
-import com.shawa.chatbotrag.entity.DocumentMetadata;
 import com.shawa.chatbotrag.entity.LLMRequest;
 import com.shawa.chatbotrag.entity.LLMResponse;
 import com.shawa.chatbotrag.entity.Message;
@@ -41,11 +37,10 @@ import com.shawa.chatbotrag.entity.PipelineLog;
 import com.shawa.chatbotrag.repository.MessageRepository;
 import com.shawa.chatbotrag.repository.ThreadRepository;
 import com.shawa.chatbotrag.service.SimpleDocumentRanker;
+import com.shawa.chatbotrag.service.MetadataEnrichmentService;
 import com.shawa.chatbotrag.service.QueryFocusedSummarizationService;
 import com.shawa.chatbotrag.entity.Thread;
 import com.shawa.chatbotrag.entity.Role;
-import com.shawa.chatbotrag.repository.DocumentMetadataRepository;
-
 //@RequiredArgsConstructor
 @CrossOrigin(origins = "*")
 @RestController
@@ -61,9 +56,10 @@ public class ChatController {
     private final ContextualQueryAugmenter queryAugmenter;
     private final MessageRepository messageRepository;
     private final ThreadRepository threadRepository;
-    private final DocumentMetadataRepository metadataRepository;
+    private final MetadataEnrichmentService metadataEnrichmentService;
 
-    public ChatController(ChatClient.Builder builder, VectorStore vectorStore, OllamaEmbeddingModel embeddingModel, QueryFocusedSummarizationService documentCompressor, ChatModel chatModel, MessageRepository messageRepository, ThreadRepository threadRepository, DocumentMetadataRepository metadataRepository) { 
+
+    public ChatController(ChatClient.Builder builder, VectorStore vectorStore, OllamaEmbeddingModel embeddingModel, QueryFocusedSummarizationService documentCompressor, ChatModel chatModel, MessageRepository messageRepository, ThreadRepository threadRepository,MetadataEnrichmentService metadataEnrichmentService) {
 
         this.queryExpander = MultiQueryExpander.builder()
             .chatClientBuilder(builder)  
@@ -71,26 +67,40 @@ public class ChatController {
             .build();
 
         this.documentRetriever = VectorStoreDocumentRetriever.builder()
-                .similarityThreshold(0.3)
                 .vectorStore(vectorStore)
-                .topK(2)  
+                .topK(3)  
                 .build();
         this.documentJoiner = new ConcatenationDocumentJoiner();
         this.documentRanker = new SimpleDocumentRanker(embeddingModel);
         this.documentCompressor = documentCompressor;
         PromptTemplate customPrompt = new PromptTemplate(
-            "Here is the retrieved context from the document(s):\n\n" +
-            "{context}\n\n" +
-            "User Query:\n{query}\n\n" +
-            "Instruction:\n" +
-            "1. If the context is relevant to the query, answer in **clear and concise Indonesian**:\n" +
-            "- Give a brief explanation based on the context.\n" +
-            "- Mention the document source (file name).\n" +
-            "- Mention the regulation status.\n" +
-            "2. If the context does **not explicitly answer** the question but contains **relevant clues or related information**, provide the best possible answer you can reasonably infer, and still mention the source and regulation status.\\n" + 
-            "3. If the context is **not relevant or unrelated** to the query, dont mention the document source or regulation status and respond with:\n" +
-            "\"Maaf, tidak ditemukan dokumen yang relevan dengan pertanyaan Anda.\""
-        );
+    "You are an AI assistant that answers questions based on Indonesian official documents.\n\n" +
+    "Instructions:\n" +
+    "- Think briefly to confirm what information directly answers the question based on the compressed context.\n" +
+    "- For each reasoning step, if applicable, mention the supporting document and its status from metadata.\n" +
+    "- Do not add new assumptions, inferences, or summarizations beyond what is provided.\n" +
+    "- Avoid re-explaining the context; only focus on producing a clear and accurate answer.\n" +
+    "- Then, infer the most accurate answer based only on those relevant parts.\n" +
+    "- Always include all relevant bullet points if they directly answer the question.\n" +
+    "- If multiple documents provide relevant information, mention all of them as long as the information is complementary and not contradictory.\n" +
+    "- Prioritize higher-authority documents when multiple sources provide overlapping information, but do not ignore valid supporting details from others.\n" +
+    "- Always verify which document most explicitly answers the question.\n" +
+    "- Do not prioritize based on word count or frequency, but based on clarity and directness.\n" +
+    "- Ignore generic structural references unless directly tied to the question.\n" +
+    "- Use only terminology that appears in the documents.\n" +
+    "- Only mention documents that are actually cited in the answer. Do not list all documents.'\n" +
+    "- Do not include opinions, suggestions, or extra interpretations outside the documents.\n\n" +
+    "Response Format:\n" +
+    "1. Think Step-by-Step (in Bahasa Indonesia)\n" +
+    "2. Final Answer (concise & clear, still in Bahasa Indonesia)\n" +
+    "3. Sources:\n" +
+    "   Judul Dokumen (Status: Status dari metadata)\n\n" +
+    "=== Context ===\n{context}\n\n" +
+    "=== Question ===\n{query}\n\n" +
+    "Jawaban:"
+);
+
+
 
         PromptTemplate emptyContextPrompt = new PromptTemplate(
             "Maaf, tidak ada informasi yang tersedia untuk menjawab pertanyaan Anda."
@@ -99,11 +109,11 @@ public class ChatController {
         this.queryAugmenter = ContextualQueryAugmenter.builder()
             .promptTemplate(customPrompt)
             .emptyContextPromptTemplate(emptyContextPrompt)
-            .allowEmptyContext(true)
+            .allowEmptyContext(false)
             .build();
         this.messageRepository = messageRepository;
         this.threadRepository = threadRepository;
-        this.metadataRepository = metadataRepository;
+        this.metadataEnrichmentService = metadataEnrichmentService;
  
         System.out.println("Using embedding model: " + embeddingModel.getClass().getName());
        this.chatClient = ChatClient.builder(chatModel)
@@ -152,44 +162,41 @@ public class ChatController {
             for (int i = 0; i < retrievedDocuments.size(); i++) {
                 log.info("Document {}: ID = {}, Content = {}", i, retrievedDocuments.get(i).getId(), retrievedDocuments.get(i).getContent());
             }
+            // Setelah ranking…
+             metadataEnrichmentService.enrichStatus(retrievedDocuments);
             List<Document> rankedDocuments = documentRanker.rank(userQuery, retrievedDocuments);
 
             log.info("Total ranked documents: {}", rankedDocuments.size());
-            for (int i = 0; i < rankedDocuments.size(); i++) {
-                log.info("Rank {}: ID = {}, Content = {}", i + 1, rankedDocuments.get(i).getId(), rankedDocuments.get(i).getContent());
+           for (Document doc : rankedDocuments) {
+                log.info("Dokumen: {} | Status: {} | Skor: {}",
+                    doc.getMetadata().get("file_name"),
+                    doc.getMetadata().get("status_peraturan"),
+                    doc.getMetadata().get("score")
+                );
             }
+            int maxDocsToCompress = 4;
+                //double minScore = 0.75;
+                List<Document> docsToCompress = rankedDocuments.stream()
+                    // .filter(doc -> {
+                    //     Object scoreObj = doc.getMetadata().get("score");
+                    //     if (scoreObj instanceof Number) {
+                    //         return ((Number) scoreObj).doubleValue() >= minScore;
+                    //     }
+                    //     return false; // jika tidak ada skor, skip
+                    // })
+                    .limit(maxDocsToCompress)
+                    .collect(Collectors.toList());
 
-            List<Document> compressedDocuments = documentCompressor.compress(userQuery, rankedDocuments);
+            List<Document> compressedDocuments = documentCompressor.compress(userQuery, docsToCompress);
+
             log.info("Compressed documents: {}", compressedDocuments.size());
             for (int i = 0; i < compressedDocuments.size(); i++) {
                 log.info("Compressed document {}: {}", i, compressedDocuments.get(i).getContent());
             }
-
-            List<Document> documentsWithMetadata = compressedDocuments.stream()
-                    .map(doc -> {
-                        String content = doc.getContent();
-                        String fileName = (String) doc.getMetadata().get("file_name");
-
-                        // Ambil metadata dari DB
-                        Optional<DocumentMetadata> metaOpt = metadataRepository.findById(fileName);
-                        String status = metaOpt.map(DocumentMetadata::getStatusPeraturan).orElse("Status tidak tersedia");
-
-                        //Tambahkan ke konten jawaban
-                        String sourceMetadata = "Sumber: " + fileName + "\nStatus Peraturan: " + status;
-                        String contentWithMetadata = content + "\n" + sourceMetadata;
-                        // String sourceMetadata = "Sumber: " + fileName;  
-                        // String contentWithMetadata = content + "\n" + sourceMetadata;
-                        return new Document(contentWithMetadata, doc.getMetadata());
-                    })
-            .collect(Collectors.toList());  
-            String augmentedQuery = queryAugmenter.augment(userQuery, documentsWithMetadata).toString();
+            String augmentedQuery = queryAugmenter.augment(userQuery, compressedDocuments).toString();
             log.info("Augmented query: {}", augmentedQuery);
             log.info(" Sending query to ChatClient...");
 
-        //    var chatResponse = chatClient.prompt()
-        //            .user(augmentedQuery)
-        //            .call()
-        //            .content();
         String rawResponse = chatClient.prompt()
             .user(augmentedQuery)
             .call()
@@ -268,4 +275,6 @@ public class ChatController {
         log.error("Gagal menulis file JSON log", e);
     }
 }
+
+
 }

@@ -1,7 +1,9 @@
 package com.shawa.chatbotrag.service;
 
+
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.io.File;
 import java.io.IOException;
@@ -9,17 +11,18 @@ import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 import java.awt.image.BufferedImage;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.transformer.splitter.TextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.ai.document.Document;
+import org.springframework.ai.transformer.splitter.TextSplitter;
 
 import com.shawa.chatbotrag.entity.DocumentMetadata;
 import com.shawa.chatbotrag.repository.DocumentMetadataRepository;
@@ -40,7 +43,7 @@ public class IngestionService {
     public IngestionService(VectorStore vectorStore, OCRService ocrService, DocumentMetadataRepository metadataRepository) {
         this.vectorStore = vectorStore;
         this.ocrService = ocrService; 
-        this.metadataRepository = metadataRepository;  
+        this.metadataRepository = metadataRepository;
     }
 
     public void ingestDocuments() {
@@ -54,7 +57,6 @@ public class IngestionService {
         IngestionStatsCollector stats = new IngestionStatsCollector();
         stats.startTimer(); // ⬅️ Tambahkan ini SEBELUM for-loop file
 
-
         for (File file : files) {
             try {
                 String cleanFileName = file.getName().replaceFirst("(?i)\\.pdf$", "").trim();
@@ -66,19 +68,8 @@ public class IngestionService {
                 DocumentMetadata metadata = parseMetadataFromFilename(cleanFileName);
                 metadataRepository.save(metadata);
                 log.info("File {} ditambahkan ke tabel document_metadata.", cleanFileName);
-                 // Load file as Spring Resource
-                //  String extractedText = hybridExtractTextPerPage(file, ocrService);
                  var result = hybridExtractTextPerPageWithStats(file, ocrService);
                 String extractedText = result.fullText();
-
-                // Resource resource = new FileSystemResource(file);
-                // String extractedText = tryExtractTextFromPdf(resource);
-
-                // if (extractedText == null || extractedText.trim().isEmpty()) {
-                //     // PDF kemungkinan hasil scan → pakai OCR
-                //     log.info("Text extraction failed or empty. Falling back to OCR for file: {}", cleanFileName);
-                //     extractedText = ocrService.extractText(resource);
-                // }
 
                 if (extractedText == null || extractedText.trim().isEmpty()) {
                     log.warn("Extracted text is still empty after OCR for file: {}", cleanFileName);
@@ -88,16 +79,47 @@ public class IngestionService {
           
                 List<Document> documents = convertTextToDocuments(extractedText, cleanFileName);
 
-                TextSplitter textSplitter = new CustomTokenTextSplitter(1000, 350,5,1200,false,150);              
-                var chunks = textSplitter.apply(documents);
+                // TextSplitter textSplitter = new CustomTokenTextSplitter(800, 500,5,1500,false,120); 
+                SafeTokenTextSplitter splitter = new SafeTokenTextSplitter(
+                    1000, // chunkSize
+                    200,  // minChunkSizeChars
+                    20,   // minChunkLengthToEmbed
+                    1000, // maxNumChunks
+                    false, // keepSeparator
+                    100   // overlapTokenCount (token-based)
+                );
+             
+                // var chunks = textSplitter.apply(documents);
+                // // vvv GANTI DENGAN BARIS INI vvv
+                // // List<Document> chunks = legalDocumentParser.parse(extractedText, metadata);
 
-                 int totalTokens = chunks.stream().mapToInt(c -> c.getContent().split("\\s+").length).sum();
+                //  int totalTokens = chunks.stream().mapToInt(c -> c.getContent().split("\\s+").length).sum();
 
-                stats.record(cleanFileName, result.totalPages(), chunks.size(), totalTokens, result.ocrPages(), result.ocrSamples());
+                // stats.record(cleanFileName, result.totalPages(), chunks.size(), totalTokens, result.ocrPages(), result.ocrSamples());
 
-    
-                vectorStore.accept(chunks);
-                log.info("VectorStore loaded with {} chunks of data from file: {}", chunks.size(), cleanFileName);
+                // vectorStore.accept(chunks);
+                // log.info("VectorStore loaded with {} chunks of data from file: {}", chunks.size(), cleanFileName);
+                // Terapkan splitter ke dokumen (ganti textSplitter -> splitter)
+            List<Document> chunks = splitter.apply(documents);
+
+            // Hitung total token secara sederhana (masih berdasarkan whitespace, boleh diganti pakai estimator jika mau lebih akurat)
+            int totalTokens = chunks.stream()
+                .mapToInt(c -> c.getContent().split("\\s+").length)
+                .sum();
+
+            // Rekam statistik seperti biasa
+            stats.record(
+                cleanFileName,
+                result.totalPages(),
+                chunks.size(),
+                totalTokens,
+                result.ocrPages(),
+                result.ocrSamples()
+            );
+
+            // Masukkan ke vector store
+            vectorStore.accept(chunks);
+            log.info("VectorStore loaded with {} chunks of data from file: {}", chunks.size(), cleanFileName);
 
             } catch (Exception e) {
                 log.error("Error during document ingestion for file: {}", file.getName(), e);
@@ -110,20 +132,31 @@ public class IngestionService {
         
     }
 
-        private List<Document> convertTextToDocuments(String extractedText, String cleanFileName) {
+    private List<Document> convertTextToDocuments(String extractedText, String cleanFileName) {
         List<Document> documents = new ArrayList<>();
         boolean isLampiran = false;
 
         String[] lines = extractedText.split("\\r?\\n");
         StringBuilder buffer = new StringBuilder();
 
+        // Regex paling fleksibel untuk "LAMPIRAN" dengan toleransi noise OCR
+
+        Pattern lampiranPattern = Pattern.compile("LAMPIRAN");
+
+
         for (String line : lines) {
             String trimmed = line.trim();
 
-        if (!isLampiran && trimmed.matches(".*\\bLAMPIRAN\\b.*")) {
-            isLampiran = true;
-            continue;
-        }
+        // Hanya coba deteksi 'LAMPIRAN' jika belum dalam mode lampiran
+            if (!isLampiran) {
+                Matcher matcher = lampiranPattern.matcher(trimmed);
+                if (matcher.find()) {
+                    isLampiran = true;
+                    log.info("Detected 'LAMPIRAN' (flexible OCR noise tolerant regex) in file {}. Skipping subsequent content.", cleanFileName);
+                    continue; // Skip baris yang mengandung penanda "LAMPIRAN" itu sendiri
+                }
+            }
+
 
             if (isLampiran) {
                 continue; // Skip seluruh lampiran
@@ -145,7 +178,7 @@ public class IngestionService {
     private DocumentMetadata parseMetadataFromFilename(String filename) {
 
     // Contoh: "Keputusan Kepala BPS Nomor 87 Tahun 2024 Tentang ..."
-     Pattern pattern = Pattern.compile("^(.*?)\\s+Nomor\\s+([a-zA-Z0-9_]+)\\s+Tahun\\s+(\\d{4})", Pattern.CASE_INSENSITIVE);
+    Pattern pattern = Pattern.compile("^(.*?)\\s+Nomor\\s+([a-zA-Z0-9_]+)\\s+Tahun\\s+(\\d{4})", Pattern.CASE_INSENSITIVE);
     Matcher matcher = pattern.matcher(filename);
 
     String jenis = null;

@@ -1,15 +1,16 @@
 package com.shawa.chatbotrag.service;
 
 import org.springframework.stereotype.Service;
-
 import io.micrometer.common.lang.NonNull;
-
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.rag.Query;
 import org.springframework.ai.rag.postretrieval.compression.DocumentCompressor;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 @Service
@@ -22,26 +23,56 @@ public class QueryFocusedSummarizationService implements DocumentCompressor {
     }
 
     @NonNull
-    @Override
-    public List<Document> compress(Query query,List<Document> documents) {
-        return documents.stream()
-                .map(doc -> new Document(summarize(doc.getContent(), query.text()), doc.getMetadata()))
-                .collect(Collectors.toList());
-    }
+@Override
+public List<Document> compress(Query query, List<Document> documents) {
+    return documents.stream()
+        .map(doc -> {
+            String summary = summarize(doc.getContent(), query.text()).trim();
+
+            if (summary.isEmpty()) {
+                return null; // Skip dokumen yang tidak relevan
+            }
+
+            // Ambil metadata
+            Map<String, Object> originalMetadata = doc.getMetadata();
+            String fileName = originalMetadata.getOrDefault("file_name", "Tidak diketahui").toString();
+            String statusPeraturan = originalMetadata.getOrDefault("status_peraturan", "Tidak diketahui").toString();
+
+            // Gabungkan ringkasan + metadata ke dalam content dokumen
+            String combinedContent = String.format(
+              "Summary:\n%s\nSource: %s\nStatus: %s",
+                summary,
+                fileName,
+                statusPeraturan
+            );
+
+
+            // Metadata tetap disalin jika ingin digunakan juga
+            Map<String, Object> metadataCopy = new HashMap<>();
+            metadataCopy.put("file_name", fileName);
+            metadataCopy.put("status_peraturan", statusPeraturan);
+
+            return new Document(combinedContent, metadataCopy);
+        })
+        .filter(Objects::nonNull)
+        .collect(Collectors.toList());
+}
+
 
     private String summarize(String content, String query) {
-           String prompt = "You are an AI system tasked with summarizing documents in Indonesian. Your goal is to generate a summary that is relevant to the given question.\n"
-                + "Question: " + query + "\n"
-                + "Document: " + content + "\n"
-                + "Instructions:\n"
-                + "- Focus the summary based on the user's question.\n"
-                + "- You may include relevant insights that are not explicitly stated, as long as they can be reasonably inferred from the document.\n"
-                + "- Avoid adding information that clearly falls outside the document's content.\n"
-                + "- Write a concise and clear summary in Indonesian.\n";
+    String prompt = String.format(
+        "You are a legal assistant that extracts only the most relevant parts from official regulatory documents.\n\n" +
+        "=== Question ===\n%s\n\n" +
+        "=== Document ===\n%s\n\n" +
+        "=== Instructions ===\n" +
+        "- Extract only information that directly answers the question using Indonesian.\n" +
+        "- Be precise. Do not add explanations, generalizations,questions, assumptions, or personal opinions.\n" +
+        "Key points:",
+        query, content
+    );
 
 
-        return chatClient.prompt(prompt)
-                      .call()
-                      .content(); // Mengambil hasil ringkasan
-    }
+    return chatClient.prompt(prompt).call().content();
+}
+
 }
